@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from mypy_boto3_bedrock_runtime.client import BedrockRuntimeClient
 from mypy_boto3_s3.client import S3Client
+import hashlib
 
 # Load configuration from YAML file
 def load_config():
@@ -65,7 +66,90 @@ def retrieve_and_generate(bedrock_client: BedrockRuntimeClient, input_prompt: st
         }
     )
 
-def process_invoice(s3_client: S3Client, bedrock_client: BedrockRuntimeClient, bucket_name: str, pdf_file_key: str) -> Dict[str, str]:
+def hash_file(file_path, algorithm="sha256"):
+    """
+    Hashes a local file using the specified algorithm.
+    
+    Args:
+        file_path (str): Path to the file to be hashed.
+        algorithm (str): Hashing algorithm to use (e.g., 'md5', 'sha1', 'sha256').
+        
+    Returns:
+        str: The hexadecimal hash of the file.
+    """
+    try:
+        hash_func = hashlib.new(algorithm)
+        with open(file_path, "rb") as f:
+            while chunk := f.read(8192):  # Read the file in chunks of 8KB
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+    except FileNotFoundError:
+        return f"File not found: {file_path}"
+    except ValueError:
+        return f"Invalid algorithm: {algorithm}"
+
+def check_item_exists_in_dynamodb(table_name, partition_key_name, partition_key_value, sort_key_name=None, sort_key_value=None):
+    dynamodb = boto3.resource('dynamodb', region_name=CONFIG['aws']['region_name'])
+    table = dynamodb.Table(table_name)
+
+    # Build the key for the item
+    key = {partition_key_name: partition_key_value}
+    if sort_key_name and sort_key_value is not None:
+        key[sort_key_name] = sort_key_value
+
+    # Try to retrieve the item
+    response = table.get_item(Key=key)
+
+    # Check if the item exists
+    if 'Item' in response:
+        print(f"Item exists: {response['Item']}")
+        return True, response['Item']
+    else:
+        print("Item does not exist.")
+        return False, None
+
+def check_duplicate_file_hash_in_dynamodb(table_name, partition_key_name, partition_key_value):
+    dynamodb = boto3.client('dynamodb', region_name=CONFIG['aws']['region_name'])
+
+    # Query the table for the partition key
+    response = dynamodb.query(
+        TableName=table_name,
+        KeyConditionExpression="#pk = :pkval",
+        ExpressionAttributeNames={
+            "#pk": partition_key_name
+        },
+        ExpressionAttributeValues={
+            ":pkval": {"S": partition_key_value}
+        }
+    )
+
+    keys = [item.get('key', {}).get('S', '') for item in response.get('Items', [])]
+
+    # Check if any items are returned
+    return len(response.get('Items', [])) > 0, keys
+
+def store_file_hash_in_dynamodb(file_path, file_hash, table_name, duplicate_hash=False):
+    """
+    Stores the file hash and file name in a DynamoDB table.
+    """
+    try:
+        # Initialize a DynamoDB client
+        dynamodb = boto3.resource('dynamodb', region_name=CONFIG['aws']['region_name'])
+        table = dynamodb.Table(table_name)
+
+        # Store the data
+        table.put_item(
+            Item={
+                'hash': file_hash,
+                'key': file_path,
+                'duplicate_hash': duplicate_hash,
+            }
+        )
+        print(f"Successfully stored hash for file '{file_path}' in table '{table_name}'.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+def process_invoice(s3_client: S3Client, bedrock_client: BedrockRuntimeClient, bucket_name: str, pdf_file_key: str, ddb_table_name: str, ddb_table_partition_key: str, ddb_table_sort_key: str) -> Dict[str, str]:
     """
     Process a single invoice by downloading it from S3 and using Bedrock to analyze it.
     
@@ -78,6 +162,8 @@ def process_invoice(s3_client: S3Client, bedrock_client: BedrockRuntimeClient, b
     Returns:
         Dict[str, Any]: Processed invoice data
     """
+    results = {}
+
     document_uri = f"s3://{bucket_name}/{pdf_file_key}"
     local_file_path = os.path.join(CONFIG['processing']['local_download_folder'], pdf_file_key)
 
@@ -85,8 +171,27 @@ def process_invoice(s3_client: S3Client, bedrock_client: BedrockRuntimeClient, b
     os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
     s3_client.download_file(bucket_name, pdf_file_key, local_file_path)
 
+    # Get the sha-256 hash of the file content
+    file_content_hash = hash_file(local_file_path)
+    print(f"Hash of file {pdf_file_key}: {file_content_hash}")
+
+    # Check if the hash already exists in DynamoDB
+    file_content_exists_in_ddb, item = check_item_exists_in_dynamodb(ddb_table_name, ddb_table_partition_key, file_content_hash, ddb_table_sort_key, pdf_file_key)
+    if item is not None:
+        results['duplicate_hash'] = item.get('duplicate_hash', False)
+
+    # Process new invoices only (i.e. hash and key do not exist in DynamoDB)
+    if not file_content_exists_in_ddb:
+        file_hash_exists_in_ddb, keys = check_duplicate_file_hash_in_dynamodb(ddb_table_name, ddb_table_partition_key, file_content_hash)
+        results['duplicate_hash'] = file_hash_exists_in_ddb
+
+        if file_hash_exists_in_ddb:
+            print(f"Duplicate hash found for file {pdf_file_key}, marking it as duplicate")
+            store_file_hash_in_dynamodb(pdf_file_key, file_content_hash, ddb_table_name, file_hash_exists_in_ddb)
+        else:
+            store_file_hash_in_dynamodb(pdf_file_key, file_content_hash, ddb_table_name)
+
     # Process invoice with different prompts
-    results = {}
     for prompt_name in ["full", "structured", "summary"]:
         response = retrieve_and_generate(bedrock_client, CONFIG['aws']['prompts'][prompt_name], document_uri)
         results[prompt_name] = response['output']['text']
@@ -156,7 +261,7 @@ def batch_process_s3_bucket_invoices(s3_client: S3Client, bedrock_client: Bedroc
     processed_count = 0
     with ThreadPoolExecutor() as executor:
         future_to_key = {
-            executor.submit(process_invoice, s3_client, bedrock_client, bucket_name, pdf_file_key): pdf_file_key
+            executor.submit(process_invoice, s3_client, bedrock_client, bucket_name, pdf_file_key, CONFIG['aws']['ddb']['table_name'], CONFIG['aws']['ddb']['table_partition_key'], CONFIG['aws']['ddb']['table_sort_key']): pdf_file_key
             for pdf_file_key in pdf_file_keys
         }
 

@@ -49,6 +49,9 @@ def display_invoice_data(invoice_data_catalog: Dict[str, Dict[str, str]], invoic
     """
     try:
         invoice_data = invoice_data_catalog[invoice_filename]
+
+        if invoice_data["duplicate_hash"]:
+            st.warning(f"This invoice ({invoice_filename}) is a duplicate of another invoice")
         
         st.subheader("Summary")
         st.write(invoice_data["summary"].replace("$", "\\$"))

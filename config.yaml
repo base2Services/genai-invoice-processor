@@ -1,6 +1,10 @@
 aws:
-  region_name: us-west-2
+  region_name: ap-southeast-2
   model_id: anthropic.claude-3-sonnet-20240229-v1:0
+  ddb:
+    table_name: testray-genai-invoice-processor
+    table_partition_key: hash
+    table_sort_key: key
   prompts:
     full: Extract data from attached invoice in key-value format.
     structured: |
