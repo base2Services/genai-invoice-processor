@@ -1,0 +1,19 @@
+[Unit]
+Description=genai-invoice-processor streamlit app
+After=network.target
+
+[Service]
+User=ssm-user
+Group=ssm-user
+WorkingDirectory=/home/ssm-user/genai-invoice-processor
+
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/bin/bash -c 'source /home/ssm-user/.bashrc && conda activate venv && cd /home/ssm-user/genai-invoice-processor && python invoices_processor.py --bucket_name=testray-bedrock-kb-invoice && streamlit run review-invoice-data.py'
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
